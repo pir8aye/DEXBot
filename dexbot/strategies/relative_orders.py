@@ -1,8 +1,9 @@
 import math
 from datetime import datetime, timedelta
 
-from dexbot.strategies.base import StrategyBase, ConfigElement, DetailElement, EXCHANGES
-from dexbot.qt_queue.idle_queue import idle_add
+from dexbot.strategies.base import StrategyBase
+from dexbot.strategies.config_parts.relative_config import RelativeConfig
+from dexbot.strategies.external_feeds.price_feed import PriceFeed
 
 
 class Strategy(StrategyBase):
@@ -11,57 +12,11 @@ class Strategy(StrategyBase):
 
     @classmethod
     def configure(cls, return_base_config=True):
-        return StrategyBase.configure(return_base_config) + [
-            ConfigElement('external_price_source', 'choice', EXCHANGES[0], 'External price source',
-                          'The bot will try to get price information from this source', EXCHANGES),
-            ConfigElement('external_feed', 'bool', False, 'External price feed',
-                          'Use external reference price instead of center price acquired from the market', None),
-            ConfigElement('amount', 'float', 1, 'Amount',
-                          'Fixed order size, expressed in quote asset, unless "relative order size" selected',
-                          (0, None, 8, '')),
-            ConfigElement('relative_order_size', 'bool', False, 'Relative order size',
-                          'Amount is expressed as a percentage of the account balance of quote/base asset', None),
-            ConfigElement('spread', 'float', 5, 'Spread',
-                          'The percentage difference between buy and sell', (0, 100, 2, '%')),
-            ConfigElement('dynamic_spread', 'bool', False, 'Dynamic spread',
-                          'Enable dynamic spread which overrides the spread field', None),
-            ConfigElement('market_depth_amount', 'float', 0, 'Market depth',
-                          'From which depth will market spread be measured? (QUOTE amount)',
-                          (0.00000001, 1000000000, 8, '')),
-            ConfigElement('dynamic_spread_factor', 'float', 1, 'Dynamic spread factor',
-                          'How many percent will own spread be compared to market spread?',
-                          (0.01, 1000, 2, '%')),
-            ConfigElement('center_price', 'float', 0, 'Center price',
-                          'Fixed center price expressed in base asset: base/quote', (0, None, 8, '')),
-            ConfigElement('center_price_dynamic', 'bool', True, 'Measure center price from market orders',
-                          'Estimate the center from closest opposite orders or from a depth', None),
-            ConfigElement('center_price_depth', 'float', 0, 'Measurement depth',
-                          'Cumulative quote amount from which depth center price will be measured',
-                          (0.00000001, 1000000000, 8, '')),
-            ConfigElement('center_price_offset', 'bool', False, 'Center price offset based on asset balances',
-                          'Automatically adjust orders up or down based on the imbalance of your assets', None),
-            ConfigElement('manual_offset', 'float', 0, 'Manual center price offset',
-                          "Manually adjust orders up or down. "
-                          "Works independently of other offsets and doesn't override them", (-50, 100, 2, '%')),
-            ConfigElement('reset_on_partial_fill', 'bool', True, 'Reset orders on partial fill',
-                          'Reset orders when buy or sell order is partially filled', None),
-            ConfigElement('partial_fill_threshold', 'float', 30, 'Fill threshold',
-                          'Order fill threshold to reset orders', (0, 100, 2, '%')),
-            ConfigElement('reset_on_price_change', 'bool', False, 'Reset orders on center price change',
-                          'Reset orders when center price is changed more than threshold '
-                          '(set False for external feeds)', None),
-            ConfigElement('price_change_threshold', 'float', 2, 'Price change threshold',
-                          'Define center price threshold to react on', (0, 100, 2, '%')),
-            ConfigElement('custom_expiration', 'bool', False, 'Custom expiration',
-                          'Override order expiration time to trigger a reset', None),
-            ConfigElement('expiration_time', 'int', 157680000, 'Order expiration time',
-                          'Define custom order expiration time to force orders reset more often, seconds',
-                          (30, 157680000, ''))
-        ]
+        return RelativeConfig.configure(return_base_config)
 
     @classmethod
     def configure_details(cls, include_default_tabs=True):
-        return StrategyBase.configure_details(include_default_tabs) + []
+        return RelativeConfig.configure_details(include_default_tabs)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -87,7 +42,7 @@ class Strategy(StrategyBase):
 
         # Set external price source, defaults to False if not found
         self.external_feed = self.worker.get('external_feed', False)
-        self.external_price_source = self.worker.get('external_price_source', None)
+        self.external_price_source = self.worker.get('external_price_source', 'gecko')
 
         if self.external_feed:
             # Get external center price from given source
@@ -99,6 +54,7 @@ class Strategy(StrategyBase):
 
         # Worker parameters
         self.is_center_price_dynamic = self.worker['center_price_dynamic']
+        self.cp_from_last_trade = self.worker.get('center_price_from_last_trade', False)
 
         if self.is_center_price_dynamic:
             self.center_price = None
@@ -106,7 +62,7 @@ class Strategy(StrategyBase):
         else:
             # Use manually set center price
             self.center_price = self.worker["center_price"]
-            
+
         self.is_relative_order_size = self.worker.get('relative_order_size', False)
         self.is_asset_offset = self.worker.get('center_price_offset', False)
         self.manual_offset = self.worker.get('manual_offset', 0) / 100
@@ -124,8 +80,15 @@ class Strategy(StrategyBase):
         self.price_change_threshold = self.worker.get('price_change_threshold', 2) / 100
         self.is_custom_expiration = self.worker.get('custom_expiration', False)
 
+        self.default_expiration = self.expiration
         if self.is_custom_expiration:
             self.expiration = self.worker.get('expiration_time', self.expiration)
+
+        if self.cp_from_last_trade:
+            # Order expiration before first trade might result in terrible price, so if default expiration will be too
+            # small, override it here
+            self.expiration = self.default_expiration
+            self.ontick -= self.tick  # Save a few cycles there
 
         self.last_check = datetime.now()
         self.min_check_interval = 8
@@ -164,32 +127,63 @@ class Strategy(StrategyBase):
         """ Ticks come in on every block. We need to periodically check orders because cancelled orders
             do not triggers a market_update event
         """
-        if (self.is_reset_on_price_change and not
-                self.counter % 8):
+        if (self.is_reset_on_price_change and not self.counter % 8):
             self.log.debug('Checking orders by tick threshold')
             self.check_orders()
         self.counter += 1
 
     @property
-    def amount_quote(self):
+    def amount_to_sell(self):
         """ Get quote amount, calculate if order size is relative
         """
+        amount = self.order_size
         if self.is_relative_order_size:
             quote_balance = float(self.balance(self.market["quote"]))
-            return quote_balance * (self.order_size / 100)
-        else:
-            return self.order_size
+            amount = quote_balance * (self.order_size / 100)
+
+        # Sell / receive amount should match x2 of minimal possible fraction of asset
+        if (amount < 2 * 10 ** -self.market['quote']['precision'] or
+                amount * self.sell_price < 2 * 10 ** -self.market['base']['precision']):
+            amount = 0
+        return amount
 
     @property
-    def amount_base(self):
+    def amount_to_buy(self):
         """ Get base amount, calculate if order size is relative
         """
+        amount = self.order_size
         if self.is_relative_order_size:
             base_balance = float(self.balance(self.market["base"]))
             # amount = % of balance / buy_price = amount combined with calculated price to give % of balance
-            return base_balance * (self.order_size / 100) / self.buy_price
-        else:
-            return self.order_size
+            amount = base_balance * (self.order_size / 100) / self.buy_price
+
+        # Sell / receive amount should match x2 of minimal possible fraction of asset
+        if (amount < 2 * 10 ** -self.market['quote']['precision'] or
+                amount * self.buy_price < 2 * 10 ** -self.market['base']['precision']):
+            amount = 0
+        return amount
+
+    def get_external_market_center_price(self, external_price_source):
+        """ Get center price from an external market for current market pair
+
+            :param external_price_source: External market name
+            :return: Center price as float
+        """
+        self.log.debug('inside get_external_mcp, exchange: {} '.format(external_price_source))
+        market = self.market.get_string('/')
+        self.log.debug('market: {}  '.format(market))
+        price_feed = PriceFeed(external_price_source, market)
+        price_feed.filter_symbols()
+        center_price = price_feed.get_center_price(None)
+        self.log.debug('PriceFeed: {}'.format(center_price))
+
+        if center_price is None:  # Try USDT
+            center_price = price_feed.get_center_price("USDT")
+            self.log.debug('Substitute USD/USDT center price: {}'.format(center_price))
+            if center_price is None:  # Try consolidated
+                center_price = price_feed.get_consolidated_price()
+                self.log.debug('Consolidated center price: {}'.format(center_price))
+        return center_price
 
     def calculate_order_prices(self):
         # Set center price as None, in case dynamic has not amount given, center price is calculated from market orders
@@ -202,14 +196,41 @@ class Strategy(StrategyBase):
 
         if self.is_center_price_dynamic:
             # Calculate center price from the market orders
-
             if self.external_feed:
                 # Try getting center price from external source
                 center_price = self.get_external_market_center_price(self.external_price_source)
-
-            if self.center_price_depth > 0 and not self.external_feed:
+                try:
+                    self.log.info('Using center price from external source: {:.8f}'.format(center_price))
+                except TypeError:
+                    self.log.warning('Failed to obtain center price from external source')
+            elif self.cp_from_last_trade and self['bootstrapped']:  # Using own last trade is bad idea at startup
+                try:
+                    center_price = self.get_own_last_trade()['price']
+                    self.log.info('Using center price from last trade: {:.8f}'.format(center_price))
+                except TypeError:
+                    center_price = self.get_market_center_price()
+                    try:
+                        self.log.info('Using market center price (failed to obtain last trade): {:.8f}'
+                                      .format(center_price))
+                    except TypeError:
+                        self.log.warning('Failed to obtain center price from market')
+            elif self.center_price_depth > 0:
                 # Calculate with quote amount if given
                 center_price = self.get_market_center_price(quote_amount=self.center_price_depth)
+                try:
+                    self.log.info('Using market center price: {:.8f} with depth: {:.{prec}f}'.format(
+                        center_price,
+                        self.center_price_depth,
+                        prec=self.market['quote']['precision']
+                    ))
+                except TypeError:
+                    self.log.warning('Failed to obtain depthted center price')
+            else:
+                center_price = self.get_market_center_price()
+                try:
+                    self.log.info('Using market center price: {:.8f}'.format(center_price))
+                except TypeError:
+                    self.log.warning('Failed to obtain center price from market')
 
             self.center_price = self.calculate_center_price(
                 center_price,
@@ -228,8 +249,12 @@ class Strategy(StrategyBase):
                 self.manual_offset
             )
 
-        self.buy_price = self.center_price / math.sqrt(1 + spread)
-        self.sell_price = self.center_price * math.sqrt(1 + spread)
+        try:
+            self.log.info('Center price after offsets calculation: {:.8f}'.format(self.center_price))
+            self.buy_price = self.center_price / math.sqrt(1 + spread)
+            self.sell_price = self.center_price * math.sqrt(1 + spread)
+        except TypeError:
+            self.log.warning('No center price calculated')
 
     def update_orders(self):
         self.log.debug('Starting to update orders')
@@ -244,20 +269,20 @@ class Strategy(StrategyBase):
         order_ids = []
         expected_num_orders = 0
 
-        amount_base = self.amount_base
-        amount_quote = self.amount_quote
+        amount_to_buy = self.amount_to_buy
+        amount_to_sell = self.amount_to_sell
 
         # Buy Side
-        if amount_base:
-            buy_order = self.place_market_buy_order(amount_base, self.buy_price, True)
+        if amount_to_buy:
+            buy_order = self.place_market_buy_order(amount_to_buy, self.buy_price, True)
             if buy_order:
                 self.save_order(buy_order)
                 order_ids.append(buy_order['id'])
             expected_num_orders += 1
 
         # Sell Side
-        if amount_quote:
-            sell_order = self.place_market_sell_order(amount_quote, self.sell_price, True)
+        if amount_to_sell:
+            sell_order = self.place_market_sell_order(amount_to_sell, self.sell_price, True)
             if sell_order:
                 self.save_order(sell_order)
                 order_ids.append(sell_order['id'])
@@ -270,6 +295,164 @@ class Strategy(StrategyBase):
         # Some orders weren't successfully created, redo them
         if len(order_ids) < expected_num_orders and not self.disabled:
             self.update_orders()
+
+    def get_market_buy_price(self, quote_amount=0, base_amount=0, **kwargs):
+        """ Returns the BASE/QUOTE price for which [depth] worth of QUOTE could be bought, enhanced with
+            moving average or weighted moving average
+
+            :param float | quote_amount:
+            :param float | base_amount:
+            :param dict | kwargs:
+                bool | exclude_own_orders: Exclude own orders when calculating a price
+            :return: price as float
+        """
+        exclude_own_orders = kwargs.get('exclude_own_orders', True)
+        market_buy_orders = []
+
+        # Exclude own orders from orderbook if needed
+        if exclude_own_orders:
+            market_buy_orders = self.get_market_buy_orders(depth=self.fetch_depth)
+            own_buy_orders_ids = [order['id'] for order in self.get_own_buy_orders()]
+            market_buy_orders = [order for order in market_buy_orders if order['id'] not in own_buy_orders_ids]
+
+        # In case amount is not given, return price of the highest buy order on the market
+        if quote_amount == 0 and base_amount == 0:
+            if exclude_own_orders:
+                if market_buy_orders:
+                    return float(market_buy_orders[0]['price'])
+                else:
+                    return 0.0
+            else:
+                return float(self.ticker().get('highestBid'))
+
+        # Like get_market_sell_price(), but defaulting to base_amount if both base and quote are specified.
+        asset_amount = base_amount
+
+        # Since the purpose is never get both quote and base amounts, favor base amount if both given because
+        # this function is looking for buy price.
+
+        if base_amount > quote_amount:
+            base = True
+        else:
+            asset_amount = quote_amount
+            base = False
+
+        if not market_buy_orders:
+            market_buy_orders = self.get_market_buy_orders(depth=self.fetch_depth)
+        market_fee = self.market['base'].market_fee_percent
+
+        target_amount = asset_amount * (1 + market_fee)
+
+        quote_amount = 0
+        base_amount = 0
+        missing_amount = target_amount
+
+        for order in market_buy_orders:
+            if base:
+                # BASE amount was given
+                if order['base']['amount'] <= missing_amount:
+                    quote_amount += order['quote']['amount']
+                    base_amount += order['base']['amount']
+                    missing_amount -= order['base']['amount']
+                else:
+                    base_amount += missing_amount
+                    quote_amount += missing_amount / order['price']
+                    break
+            elif not base:
+                # QUOTE amount was given
+                if order['quote']['amount'] <= missing_amount:
+                    quote_amount += order['quote']['amount']
+                    base_amount += order['base']['amount']
+                    missing_amount -= order['quote']['amount']
+                else:
+                    base_amount += missing_amount * order['price']
+                    quote_amount += missing_amount
+                    break
+
+        # Prevent division by zero
+        if not quote_amount:
+            return 0.0
+
+        return base_amount / quote_amount
+
+    def get_market_sell_price(self, quote_amount=0, base_amount=0, **kwargs):
+        """ Returns the BASE/QUOTE price for which [quote_amount] worth of QUOTE could be bought,
+            enhanced with moving average or weighted moving average.
+
+            [quote/base]_amount = 0 means lowest regardless of size
+
+            :param float | quote_amount:
+            :param float | base_amount:
+            :param dict | kwargs:
+                bool | exclude_own_orders: Exclude own orders when calculating a price
+            :return:
+        """
+        exclude_own_orders = kwargs.get('exclude_own_orders', True)
+        market_sell_orders = []
+
+        # Exclude own orders from orderbook if needed
+        if exclude_own_orders:
+            market_sell_orders = self.get_market_sell_orders(depth=self.fetch_depth)
+            own_sell_orders_ids = [order['id'] for order in self.get_own_sell_orders()]
+            market_sell_orders = [order for order in market_sell_orders if order['id'] not in own_sell_orders_ids]
+
+        # In case amount is not given, return price of the lowest sell order on the market
+        if quote_amount == 0 and base_amount == 0:
+            if exclude_own_orders:
+                if market_sell_orders:
+                    return float(market_sell_orders[0]['price'])
+                else:
+                    return 0.0
+            else:
+                return float(self.ticker().get('lowestAsk'))
+
+        asset_amount = quote_amount
+
+        # Since the purpose is never get both quote and base amounts, favor quote amount if both given because
+        # this function is looking for sell price.
+        if quote_amount > base_amount:
+            quote = True
+        else:
+            asset_amount = base_amount
+            quote = False
+
+        if not market_sell_orders:
+            market_sell_orders = self.get_market_sell_orders(depth=self.fetch_depth)
+        market_fee = self.market['quote'].market_fee_percent
+
+        target_amount = asset_amount * (1 + market_fee)
+
+        quote_amount = 0
+        base_amount = 0
+        missing_amount = target_amount
+
+        for order in market_sell_orders:
+            if quote:
+                # QUOTE amount was given
+                if order['quote']['amount'] <= missing_amount:
+                    quote_amount += order['quote']['amount']
+                    base_amount += order['base']['amount']
+                    missing_amount -= order['quote']['amount']
+                else:
+                    base_amount += missing_amount * order['price']
+                    quote_amount += missing_amount
+                    break
+            elif not quote:
+                # BASE amount was given
+                if order['base']['amount'] <= missing_amount:
+                    quote_amount += order['quote']['amount']
+                    base_amount += order['base']['amount']
+                    missing_amount -= order['base']['amount']
+                else:
+                    base_amount += missing_amount
+                    quote_amount += missing_amount / order['price']
+                    break
+
+        # Prevent division by zero
+        if not quote_amount:
+            return 0.0
+
+        return base_amount / quote_amount
 
     def _calculate_center_price(self, suppress_errors=False):
         highest_bid = float(self.ticker().get('highestBid'))
@@ -387,15 +570,14 @@ class Strategy(StrategyBase):
         else:
             # Loop trough the orders and look for changes
             for order_id, order in orders.items():
+                if not order_id.startswith('1.7.'):
+                    need_update = True
+                    break
                 current_order = self.get_order(order_id)
 
                 if not current_order:
                     need_update = True
-                    self.log.debug('Could not found order on the market, it was filled, expired or cancelled')
-                    # Write a trade log entry only when we are not using custom expiration because we cannot
-                    # distinguish an expired order from filled
-                    if not self.is_custom_expiration:
-                        self.write_order_log(self.worker_name, order)
+                    self.log.debug('Could not find order on the market, it was filled, expired or cancelled')
                 elif self.is_reset_on_partial_fill:
                     # Detect partially filled orders;
                     # on fresh order 'for_sale' is always equal to ['base']['amount']
@@ -408,6 +590,8 @@ class Strategy(StrategyBase):
                             # FIXME: Need to write trade operation; possible race condition may occur: while
                             #        we're updating order it may be filled further so trade log entry will not
                             #        be correct
+            if need_update:
+                self['bootstrapped'] = True
 
         # Check center price change when using market center price with reset option on change
         if self.is_reset_on_price_change and self.is_center_price_dynamic:
@@ -443,3 +627,23 @@ class Strategy(StrategyBase):
             self.update_gui_profit()
 
         self.last_check = datetime.now()
+
+    def get_own_last_trade(self):
+        """ Returns dict with amounts and price of last trade """
+        history = self.account.history(only_ops=['fill_order'])
+        for entry in history:
+            trade = entry['op'][1]
+            # Look for first trade in worker's market
+            if trade['pays']['asset_id'] == self.market['base']['id']:  # Buy order
+                base = trade['fill_price']['base']['amount'] / 10 ** self.market['base']['precision']
+                quote = trade['fill_price']['quote']['amount'] / 10 ** self.market['quote']['precision']
+                break
+            elif trade['pays']['asset_id'] == self.market['quote']['id']:  # Sell order
+                base = trade['fill_price']['quote']['amount'] / 10 ** self.market['base']['precision']
+                quote = trade['fill_price']['base']['amount'] / 10 ** self.market['quote']['precision']
+                break
+        try:
+            return {'base': base, 'quote': quote, 'price': base / quote}
+        except UnboundLocalError:
+            # base or quote wasn't obtained
+            return None

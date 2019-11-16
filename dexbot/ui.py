@@ -1,4 +1,5 @@
 import os
+import os.path
 import sys
 import logging
 import logging.config
@@ -6,10 +7,15 @@ from functools import update_wrapper
 
 import click
 from ruamel import yaml
+from appdirs import user_data_dir
+
 from bitshares import BitShares
 from bitshares.instance import set_shared_bitshares_instance
+from bitshares.exceptions import WrongMasterPasswordException
 
+from dexbot import VERSION, APP_NAME, AUTHOR
 from dexbot.config import Config
+from dexbot.node_manager import get_sorted_nodelist, ping
 
 log = logging.getLogger(__name__)
 
@@ -43,16 +49,27 @@ def verbose(f):
         logger.addHandler(ch)
 
         # Logging to a file
-        fh = logging.FileHandler('dexbot.log')
+        filename = ctx.obj.get('logfile')
+        if not filename:
+            # By default, log to a user data dir
+            data_dir = user_data_dir(APP_NAME, AUTHOR)
+            filename = os.path.join(data_dir, 'dexbot.log')
+
+        fh = logging.FileHandler(filename)
         fh.setFormatter(formatter2)
         logger.addHandler(fh)
 
         logger.propagate = False  # Don't double up with root logger
-        # Set the root logger with basic format
+        # Configure root logger
+        root_logger = logging.getLogger("dexbot")
         ch = logging.StreamHandler()
         ch.setFormatter(formatter1)
-        logging.getLogger("dexbot").addHandler(ch)
+        root_logger.addHandler(ch)
+        root_logger.setLevel(getattr(logging, verbosity.upper()))
         logging.getLogger("").handlers = []
+
+        # Print logfile using main logger
+        root_logger.info('Dexbot version {}, logfile: {}'.format(VERSION, filename))
 
         # GrapheneAPI logging
         if ctx.obj["verbose"] > 4:
@@ -78,9 +95,24 @@ def verbose(f):
 def chain(f):
     @click.pass_context
     def new_func(ctx, *args, **kwargs):
+        nodelist = ctx.config["node"]
+        timeout = int(ctx.obj.get("sortnodes"))
+
+        host_ip = '8.8.8.8'
+        if ping(host_ip, 3) is False:
+            click.echo("internet NOT available! Please check your connection!")
+            log.critical("Internet not available, exiting")
+            sys.exit(78)
+
+        if timeout > 0:
+            click.echo("Checking for nearest nodes with timeout < {} sec....".format(timeout))
+            nodelist = get_sorted_nodelist(ctx.config["node"], timeout)
+            click.echo("Nearest nodes ->  " + str(nodelist))
+
         ctx.bitshares = BitShares(
-            ctx.config["node"],
+            nodelist,
             num_retries=-1,
+            expiration=60,
             **ctx.obj
         )
         set_shared_bitshares_instance(ctx.bitshares)
@@ -96,22 +128,30 @@ def unlock(f):
             if ctx.bitshares.wallet.created():
                 if "UNLOCK" in os.environ:
                     pwd = os.environ["UNLOCK"]
+                    if pwd[:12] == "/run/secrets":
+                        pwd = open(pwd).read()
                 else:
                     if systemd:
                         # No user available to interact with
-                        log.critical("Passphrase not available, exiting")
+                        log.critical("Uptick Passphrase not available, exiting")
                         sys.exit(78)  # 'configuration error' in sysexits.h
                     pwd = click.prompt(
-                        "Current Wallet Passphrase", hide_input=True)
-                ctx.bitshares.wallet.unlock(pwd)
+                        "Current Uptick Wallet Passphrase", hide_input=True)
+                try:
+                    ctx.bitshares.wallet.unlock(pwd)
+                except WrongMasterPasswordException:
+                    log.critical("Password error, exiting")
+                    sys.exit(78)
             else:
                 if systemd:
                     # No user available to interact with
-                    log.critical("Wallet not installed, cannot run")
+                    log.critical("Uptick Wallet not installed, cannot run")
                     sys.exit(78)
-                click.echo("No wallet installed yet. Creating ...")
+                click.echo("No Uptick wallet installed yet. \n" +
+                           "This is a password for encrypting " +
+                           "the file that contains your private keys.  Creating ...")
                 pwd = click.prompt(
-                    "Wallet Encryption Passphrase",
+                    "Uptick Wallet Encryption Passphrase",
                     hide_input=True,
                     confirmation_prompt=True)
                 ctx.bitshares.wallet.create(pwd)
@@ -133,7 +173,7 @@ def priceChange(new, old):
     if float(old) == 0.0:
         return -1
     else:
-        percent = ((float(new) - float(old))) / float(old) * 100
+        percent = (float(new) - float(old)) / float(old) * 100
         if percent >= 0:
             return click.style("%.2f" % percent, fg="green")
         else:
